@@ -194,5 +194,115 @@ namespace Blockcore.Features.WalletWatchOnly.Api.Controllers
             HdAccount account = this.walletManager.GetAccounts(walletName).First();
             return new WalletAccountReference(walletName, account.Name);
         }
+
+        [ActionName("importaddress")]
+        [ActionDescription(
+            "Adds a script (in hex) or address that can be watched as if it were in your wallet but cannot be used to spend. Requires a new wallet backup.")]
+        public bool ImportAddress(string address, string label, bool rescan = true, bool p2Sh = false)
+        {
+            Guard.NotEmpty(nameof(address), address);
+
+            var isP2Pkh = !p2Sh && BitcoinPubKeyAddress.IsValid(address, Network);
+            var isP2Sh = p2Sh && BitcoinScriptAddress.IsValid(address, Network);
+            Guard.Assert(isP2Pkh || isP2Sh);
+
+            this.watchOnlyWalletManager.WatchAddress(address);
+
+            if (rescan)
+            {
+                this.RescanBlockChain(null,null);
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Rescan the local blockchain for wallet related transactions.
+        /// </summary>
+        /// <param name="startHeight">The start height.</param>
+        /// <param name="stopHeight">The last block height that should be scanned.</param>
+        /// <returns>(RescanBlockChainModel) Start height and stopped height.</returns>
+        [ActionName("rescanblockchain")]
+        [ActionDescription("Rescan the local blockchain for wallet related transactions.")]
+        public RescanBlockChainModel RescanBlockChain(int? startHeight = null, int? stopHeight = null)
+        {
+            // genesis does not have transactions and can't be scanned start from 1 if below 1
+            startHeight ??= 1;
+            stopHeight ??= this.chainIndexer.Height;
+
+            if (startHeight > stopHeight)
+            {
+                throw new ArgumentException( "Start height cannot be higher then stop height", nameof(startHeight));
+            }
+            if (stopHeight <= 0)
+            {
+                throw new ArgumentException("Start height must be greater than 0", nameof(stopHeight));
+            }
+            if (startHeight > this.chainIndexer.Height)
+            {
+                throw new ArgumentException("Chain is shorter", nameof(startHeight));
+            }
+            if (stopHeight > this.chainIndexer.Height)
+            {
+                throw new ArgumentException("Chain is shorter", nameof(stopHeight));
+            }
+
+            var rescanBlockChainModel = new RescanBlockChainModel
+            {
+                StartHeight = startHeight.Value
+            };
+
+            var walletUpdated = false;
+            var hasWallets = this.walletManager.ContainsWallets;
+
+            for (int height = startHeight.Value; height <= stopHeight; height++)
+            {
+                var chainedHeader = this.chainIndexer.GetHeader(height);
+                var block = this.blockStore.GetBlock(chainedHeader.HashBlock);
+
+                foreach (Transaction transaction in block.Transactions)
+                {
+                    // Update full wallets
+                    bool trxFound = false;
+                    if (hasWallets)
+                    {
+                        trxFound = this.walletManager.ProcessTransaction(transaction, chainedHeader.Height, block);
+                    }
+
+                    walletUpdated = trxFound || walletUpdated;
+
+                    // Potentially update watch-only wallet if the transaction affects a watched address.
+                    this.watchOnlyWalletManager.ProcessTransaction(transaction, block);
+                }
+
+                // Update the wallets with the last processed block height.
+                // It's important that updating the height happens after the block processing is complete,
+                // as if the node is stopped, on re-opening it will start updating from the previous height.
+                foreach (var walletName in this.walletManager.GetWalletsNames())
+                {
+                    var wallet = this.walletManager.GetWallet(walletName);
+                    wallet.BlockLocator = chainedHeader.GetLocator().Blocks;
+
+                    foreach (AccountRoot accountRoot in wallet.AccountsRoot.Where(a => a.CoinType == Network.Consensus.CoinType))
+                    {
+                        if (accountRoot.LastBlockSyncedHeight != null && !(accountRoot.LastBlockSyncedHeight < height)) continue;
+
+                        accountRoot.LastBlockSyncedHeight = chainedHeader.Height;
+                        accountRoot.LastBlockSyncedHash = chainedHeader.HashBlock;
+                    }
+                }
+
+                rescanBlockChainModel.StopHeight = height;
+            }
+
+            if (walletUpdated)
+            {
+                this.walletManager.SaveWallets();
+            }
+
+            this.watchOnlyWalletManager.SaveWatchOnlyWallet();
+
+            return rescanBlockChainModel;
+        }
     }
 }
