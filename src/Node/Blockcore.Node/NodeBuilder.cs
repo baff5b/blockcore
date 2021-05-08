@@ -35,7 +35,7 @@ namespace Blockcore.Node
             {
                 case "BTC":
                 case "XRC":
-                    nodeBuilder.UsePowConsensus().AddMining().UseWallet();
+                    nodeBuilder.UsePowConsensus().AddMining().UseWallet().UseWatchOnlyWallet();
                     break;
                 case "X1":
                     nodeBuilder.UseX1Consensus().UseColdStakingWallet();
