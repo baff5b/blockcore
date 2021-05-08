@@ -69,6 +69,7 @@ namespace Blockcore.Features.WalletWatchOnly
             {
                 foreach (WatchTransactionData transaction in address.Transactions.Values)
                 {
+                    transaction.Address = address.Address;
                     txDict.TryAdd(transaction.Id, transaction);
                 }
             }
@@ -175,6 +176,11 @@ namespace Blockcore.Features.WalletWatchOnly
         [JsonProperty(PropertyName = "merkleProof", NullValueHandling = NullValueHandling.Ignore)]
         [JsonConverter(typeof(BitcoinSerializableJsonConverter))]
         public PartialMerkleTree MerkleProof { get; set; }
+
+        /**
+         * 
+         */
+        public string Address { get; set; }
     }
 
     /// <summary>

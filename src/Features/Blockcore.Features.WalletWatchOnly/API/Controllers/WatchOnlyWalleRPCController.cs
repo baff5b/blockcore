@@ -6,10 +6,10 @@ using Blockcore.Consensus;
 using Blockcore.Consensus.Chain;
 using Blockcore.Consensus.TransactionInfo;
 using Blockcore.Controllers;
-using Blockcore.Controllers.Models;
 using Blockcore.Features.RPC;
 using Blockcore.Features.RPC.Exceptions;
 using Blockcore.Features.Wallet;
+using Blockcore.Features.Wallet.Api.Models;
 using Blockcore.Features.Wallet.Database;
 using Blockcore.Features.Wallet.Interfaces;
 using Blockcore.Features.Wallet.Types;
@@ -83,79 +83,164 @@ namespace Blockcore.Features.WalletWatchOnly.Api.Controllers
 
         [ActionName("listtransactions")]
         [ActionDescription("Returns up to 'count' most recent transactions skipping the first 'skip' transactions.")]
-        public ListTransactionsModel[] ListTransactions(string account = "*", int count = 10, int skip = 0, bool include_watchonly = true)
+        public List<ListTransactionsModel> ListTransactions(string account = "*", int count = 10, int skip = 0,
+            bool includeWatchOnly = true)
         {
-            List<ListTransactionsModel> result = new List<ListTransactionsModel>();
+            var listTransactionsModels = new List<ListTransactionsModel>();
+
+            if (count < 0)
+            {
+                throw new ArgumentException("Negative count", nameof(count));
+            }
+
+            if (skip < 0)
+            {
+                throw new ArgumentException("Negative skip", nameof(skip));
+            }
+
+            // Transaction dictionary of <Transaction, isWatchOnly>
+            // isWatchOnly to be used to specify that the transaction is watch only.
+            var transactions = new Dictionary<TransactionOutputData, bool>();
+
             WalletAccountReference accountReference = this.GetWalletAccountReference();
 
-            if (include_watchonly)
+            // Get all watch-only transactions.
+            if (includeWatchOnly)
             {
-                var selectedWatchOnlyTransactions = this.watchOnlyWalletManager.GetWatchedTransactions().Values
+                var selectedWatchOnlyTransactions = this.watchOnlyWalletManager
+                    .GetWatchedTransactions()
+                    .Values
                     .Skip(skip)
                     .Take(count);
-                foreach (var transactionData in selectedWatchOnlyTransactions)
+                foreach (var watchTransactionData in selectedWatchOnlyTransactions)
                 {
-                    var transactionInfo = this.GetTransactionInfo(transactionData.Id);
-                    var transactionResult = this.GetTransactionsModel(transactionInfo);
-                    result.Add(transactionResult);
+                    var watchedTransaction = this.blockStore.GetTransactionById(watchTransactionData.Id);
+                    if (watchedTransaction == null) continue;
+
+                    var watchedOutput = watchedTransaction.Outputs.Find(
+                        txOut => txOut.ScriptPubKey.GetDestinationAddress(Network).ToString() ==
+                                 watchTransactionData.Address);
+                    
+                    var transactionData = new TransactionOutputData()
+                    {
+                        Address = watchTransactionData.Address,
+                        Amount = watchedOutput != null ? watchedOutput.Value : 0,
+                        Id = watchTransactionData.Id,
+                        BlockHash = watchTransactionData.BlockHash,
+                        BlockHeight = GetTransactionBlockHeader(watchTransactionData.Id).Height, 
+                        MerkleProof = watchTransactionData.MerkleProof
+                    };
+
+                    transactions.Add(transactionData, true);
                 }
             }
 
+            // Get all wallet transactions for the specified wallet.
+            Func<HdAccount, bool> accountFilter = account == "*" || account == null ?
+                Wallet.Types.Wallet.AllAccounts :
+                a => a.Name == account;
+
             Wallet.Types.Wallet wallet = this.walletManager.GetWallet(accountReference.WalletName);
-            Func<HdAccount, bool> accountFilter = null;
-            if (account == "*" || account == null)
-            {
-                accountFilter = Wallet.Types.Wallet.AllAccounts;
-            }
-            else
-            {
-                accountFilter = a => a.Name == account;
-            }
+
             IEnumerable<TransactionOutputData> selectedTransactions = wallet.GetAllTransactions(accountFilter)
                 .Skip(skip)
                 .Take(count);
             foreach (var transactionData in selectedTransactions)
             {
-                var transactionInfo = this.GetTransactionInfo(transactionData.Id);
-                var transactionResult = this.GetTransactionsModel(transactionInfo);
-                result.Add(transactionResult);
+                transactions.Add(transactionData, false);
             }
 
-            return result.ToArray();
-        }
-
-        internal ListTransactionsModel GetTransactionsModel(TransactionVerboseModel transactionInfo)
-        {
-            var transactionResult = new ListTransactionsModel
+            // Collect all related outputs for a given transaction.
+            foreach ((TransactionOutputData transactionOutputData, bool isWatchOnly) in transactions)
             {
-                Confirmations = transactionInfo.Confirmations ?? 0,
-                BlockHash = transactionInfo.BlockHash ?? string.Empty,
-                BlockTime = transactionInfo.BlockTime ?? 0,
-                TransactionId = transactionInfo.TxId,
-                TransactionTime = (long)(transactionInfo.Time ?? 0),
-                Amount = transactionInfo.VOut.Sum(a => a.Value)
+                listTransactionsModels.AddRange(
+                    GetListTransactionModels(transactionOutputData, isWatchOnly));
+            }
+
+            // From bitcoin/src/wallet/rpcwallet.cpp: iterate backwards until we have nCount items to return
+            listTransactionsModels.Sort((ListTransactionsModel x, ListTransactionsModel y) =>
+            {
+                if (x.BlockHeight == y.BlockHeight) return 0;
+                return x.BlockHeight > y.BlockHeight ? -1 : 1;
+            });
+
+            return listTransactionsModels;
+        }
+        
+        /**
+         * Collects all related outputs for a given transaction.
+         * 1. For "send" transactions, find a later transaction that spent an output.
+         * 2. For "receive" transactions, just render the output.
+         */
+        private IEnumerable<ListTransactionsModel> GetListTransactionModels(
+            TransactionOutputData transactionOutputData, bool isWatchOnly)
+        {
+            var transaction = this.blockStore.GetTransactionById(transactionOutputData.Id);
+            var chainedHeader = GetTransactionBlockHeader(transactionOutputData.Id);            
+
+            if (transaction == null)
+            {
+                return new List<ListTransactionsModel>();
+            }
+
+            var listTransactionModels = new List<ListTransactionsModel>();
+            uint blockTime = Utils.DateTimeToUnixTime(chainedHeader.Header.BlockTime);
+
+            // Add all "receives" to the wallet.
+            var listTransactionModel = new ListTransactionsModel()
+            {
+                InvolvesWatchOnly = isWatchOnly,
+                Amount = transactionOutputData.Amount.ToDecimal(MoneyUnit.BTC),
+                Address = transactionOutputData.Address,
+                Category = ListSinceBlockTransactionCategoryModel.Receive,
+                TransactionId = transaction.GetHash().ToString(),
+                BlockHeight = chainedHeader.Height,
+                BlockHash = chainedHeader.HashBlock.ToString(),
+                BlockTime = blockTime,
+                TransactionTime = blockTime,
+                Confirmations = this.chainIndexer.Tip.Height - chainedHeader.Height + 1
             };
-            return transactionResult;
+
+            if (transaction.IsCoinBase)
+            {
+                // COIN_MATURITY = 100 as part of bitcoin consensus.
+                listTransactionModel.Category = listTransactionModel.Confirmations < 100 ? 
+                    ListSinceBlockTransactionCategoryModel.Immature : 
+                    ListSinceBlockTransactionCategoryModel.Generate;
+            }
+
+            listTransactionModels.Add(listTransactionModel);
+
+            var spendingDetails = transactionOutputData.SpendingDetails;
+            if (spendingDetails?.BlockHeight == null) return listTransactionModels;
+            var spendChainHeader = GetTransactionBlockHeader(spendingDetails.TransactionId);
+
+            var spentTransactionOutput = new ListTransactionsModel()
+            {
+                InvolvesWatchOnly = isWatchOnly,
+                Amount = -transactionOutputData.Amount.ToDecimal(MoneyUnit.BTC),
+                Address = transactionOutputData.Address,
+                Category = ListSinceBlockTransactionCategoryModel.Send,
+                TransactionId = spendingDetails.TransactionId.ToString(),
+                BlockHeight = spendingDetails.BlockHeight ?? -1,
+                BlockHash = spendingDetails.IsSpentConfirmed() ? spendChainHeader.HashBlock.ToString() : "",
+                BlockTime = spendChainHeader.Header.Time,
+                Confirmations = this.chainIndexer.Tip.Height - spendChainHeader.Height + 1,
+                TimeReceived = Utils.DateTimeToUnixTime(spendingDetails.CreationTime)
+            };
+
+            listTransactionModels.Add(spentTransactionOutput);
+
+            return listTransactionModels;
         }
 
-        internal TransactionVerboseModel GetTransactionInfo(uint256 transactionId)
+        private ChainedHeader GetTransactionBlockHeader(uint256 transactionid)
         {
-            Transaction transaction = this.blockStore?.GetTransactionById(transactionId);
-            ChainedHeader block = this.GetTransactionBlock(transactionId, this.fullNode, this.chainIndexer);
-            var transactionInfo = new TransactionVerboseModel(transaction, this.network, block, this.chainState?.ConsensusTip);
-
-            return transactionInfo;
-        }
-
-        internal ChainedHeader GetTransactionBlock(uint256 trxid, IFullNode fullNode, ChainIndexer chain)
-        {
-            Guard.NotNull(fullNode, nameof(fullNode));
-
             ChainedHeader block = null;
-            uint256 blockid = this.blockStore?.GetBlockIdByTransactionId(trxid);
+            uint256 blockid = this.blockStore?.GetBlockIdByTransactionId(transactionid);
             if (blockid != null)
             {
-                block = chain?.GetHeader(blockid);
+                block = this.chainIndexer?.GetHeader(blockid);
             }
             return block;
         }

@@ -9,7 +9,7 @@ namespace Blockcore.Features.WalletWatchOnly.Api.Models
         /// Only returns true if imported addresses were involved in transaction.
         /// </summary>
         [JsonProperty("involvesWatchonly")]
-        public string InvolvesWatchOnly { get; set; } = "";
+        public bool InvolvesWatchOnly { get; set; }
 
         /// <summary>
         /// The bitcoin address of the transaction.
@@ -41,7 +41,7 @@ namespace Blockcore.Features.WalletWatchOnly.Api.Models
         /// 'send' category of transactions.
         /// </summary>
         [JsonProperty("vout", NullValueHandling = NullValueHandling.Ignore)]
-        public int VOut { get; set; }
+        public uint VOut { get; set; }
 
         /// <summary>
         /// The block hash.
@@ -64,6 +64,11 @@ namespace Blockcore.Features.WalletWatchOnly.Api.Models
         /// </summary>
         [JsonProperty("blockhash", NullValueHandling = NullValueHandling.Ignore)]
         public string BlockHash { get; set; }
+
+        /// <summary>
+        /// The block height containing the transaction.
+        /// </summary>
+        public int BlockHeight { get; set; }
 
         /// <summary>
         /// The index of the transaction in the block that includes it.
